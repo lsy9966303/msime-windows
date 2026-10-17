@@ -57,6 +57,11 @@ class EnglishDictionary
         std::int64_t weight;
     };
     std::vector<SpellingEntry> spelling_index_;
+    // Iterative arg-best tree: two indices per row (at most 8 MB on 64-bit).
+    std::vector<size_t> spelling_best_;
+    size_t better_spelling_entry(size_t left, size_t right) const;
+    size_t best_spelling_entry(size_t begin, size_t end) const;
+    std::vector<size_t> query_spelling_prefix(const std::string &prefix) const;
     int spelling_data_version_ = -1;
     std::unordered_map<std::string, std::string> custom_en_zh_;
     std::unordered_map<std::string, std::string> custom_zh_en_;

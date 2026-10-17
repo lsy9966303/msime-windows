@@ -110,7 +110,8 @@ std::vector<WordItem> EnglishDictionary::query_candidates(const std::string &inp
         return result;
     // The sorted index is built only on the first typo, and refreshed only after
     // a dictionary write. Binary prefix probes avoid hundreds of SQL calls per
-    // typo. Input bounds cap probes at 1321; each spelling contributes three rows.
+    // typo. Input bounds cap probes at 1321; each spelling takes three ranked
+    // rows using O(log N) range queries, without scanning a broad prefix.
     std::map<std::string, int> variants;
     const auto add = [&](std::string value, int cost) {
         if (value != prefix && value.size() >= 2)
@@ -155,27 +156,9 @@ std::vector<WordItem> EnglishDictionary::query_candidates(const std::string &inp
     std::map<std::string, Match> unique;
     for (const auto &[variant, cost] : variants)
     {
-        auto found =
-            std::lower_bound(spelling_index_.begin(), spelling_index_.end(), variant,
-                             [](const SpellingEntry &entry, const std::string &key) { return entry.key < key; });
-        std::vector<const SpellingEntry *> best;
-        for (; found != spelling_index_.end() && found->key.compare(0, variant.size(), variant) == 0; ++found)
+        for (const auto index : query_spelling_prefix(variant))
         {
-            best.push_back(&*found);
-            std::sort(best.begin(), best.end(), [&](const auto *a, const auto *b) {
-                if ((a->key == variant) != (b->key == variant))
-                    return a->key == variant;
-                if (a->weight != b->weight)
-                    return a->weight > b->weight;
-                if (a->key.size() != b->key.size())
-                    return a->key.size() < b->key.size();
-                return std::tie(a->key, a->display) < std::tie(b->key, b->display);
-            });
-            if (best.size() > 3)
-                best.pop_back();
-        }
-        for (const auto *entry : best)
-        {
+            const auto *entry = &spelling_index_[index];
             if (entry->key == prefix)
                 continue;
             WordItem item(entry->key, entry->display, entry->weight, CandidateSource::EnglishDictionary);
@@ -216,6 +199,79 @@ std::vector<WordItem> EnglishDictionary::query_candidates(const std::string &inp
     return result;
 }
 
+size_t EnglishDictionary::better_spelling_entry(size_t left, size_t right) const
+{
+    const size_t size = spelling_index_.size();
+    if (left == size)
+        return right;
+    if (right == size)
+        return left;
+    const auto &a = spelling_index_[left];
+    const auto &b = spelling_index_[right];
+    if (a.weight != b.weight)
+        return a.weight > b.weight ? left : right;
+    if (a.key.size() != b.key.size())
+        return a.key.size() < b.key.size() ? left : right;
+    return std::tie(a.key, a.display) < std::tie(b.key, b.display) ? left : right;
+}
+
+size_t EnglishDictionary::best_spelling_entry(size_t begin, size_t end) const
+{
+    const size_t size = spelling_index_.size();
+    size_t best = size;
+    for (begin += size, end += size; begin < end; begin /= 2, end /= 2)
+    {
+        if (begin % 2 != 0)
+            best = better_spelling_entry(best, spelling_best_[begin++]);
+        if (end % 2 != 0)
+            best = better_spelling_entry(best, spelling_best_[--end]);
+    }
+    return best;
+}
+
+std::vector<size_t> EnglishDictionary::query_spelling_prefix(const std::string &prefix) const
+{
+    const auto lower = [](const SpellingEntry &entry, const std::string &key) { return entry.key < key; };
+    const auto begin = std::lower_bound(spelling_index_.begin(), spelling_index_.end(), prefix, lower);
+    const auto exact_end =
+        std::upper_bound(begin, spelling_index_.end(), prefix,
+                         [](const std::string &key, const SpellingEntry &entry) { return key < entry.key; });
+    const auto end = std::lower_bound(exact_end, spelling_index_.end(), prefix + "{", lower);
+    std::vector<size_t> best;
+    const auto append = [&](size_t first, size_t last) {
+        std::vector<std::pair<size_t, size_t>> ranges;
+        if (first < last)
+            ranges.emplace_back(first, last);
+        while (best.size() < 3 && !ranges.empty())
+        {
+            size_t selected = spelling_index_.size();
+            size_t selected_range = 0;
+            for (size_t i = 0; i < ranges.size(); ++i)
+            {
+                const size_t candidate = best_spelling_entry(ranges[i].first, ranges[i].second);
+                if (better_spelling_entry(candidate, selected) == candidate)
+                {
+                    selected = candidate;
+                    selected_range = i;
+                }
+            }
+            const auto [left, right] = ranges[selected_range];
+            ranges[selected_range] = ranges.back();
+            ranges.pop_back();
+            if (left < selected)
+                ranges.emplace_back(left, selected);
+            if (selected + 1 < right)
+                ranges.emplace_back(selected + 1, right);
+            best.push_back(selected);
+        }
+    };
+    append(static_cast<size_t>(begin - spelling_index_.begin()),
+           static_cast<size_t>(exact_end - spelling_index_.begin()));
+    append(static_cast<size_t>(exact_end - spelling_index_.begin()),
+           static_cast<size_t>(end - spelling_index_.begin()));
+    return best;
+}
+
 bool EnglishDictionary::ensure_correction_index()
 {
     if (!ensure_query_statement())
@@ -248,6 +304,7 @@ bool EnglishDictionary::ensure_correction_index()
         {
             sqlite3_finalize(query);
             spelling_index_.clear();
+            spelling_best_.clear();
             spelling_data_version_ = current_version;
             return true; // Do not repeat an oversized index build on every key.
         }
@@ -257,6 +314,15 @@ bool EnglishDictionary::ensure_correction_index()
     if (status != SQLITE_DONE)
         return false;
     spelling_index_ = std::move(entries);
+    const size_t size = spelling_index_.size();
+    spelling_best_.resize(2 * size);
+    for (size_t i = 0; i < size; ++i)
+        spelling_best_[size + i] = i;
+    for (size_t i = size; i > 1; --i)
+    {
+        const size_t parent = i - 1;
+        spelling_best_[parent] = better_spelling_entry(spelling_best_[2 * parent], spelling_best_[2 * parent + 1]);
+    }
     spelling_data_version_ = current_version;
     return true;
 }
@@ -551,6 +617,7 @@ bool EnglishDictionary::ensure_gloss_statements()
 void EnglishDictionary::close_database()
 {
     spelling_index_.clear();
+    spelling_best_.clear();
     spelling_data_version_ = -1;
     if (mixed_query_statement_ != nullptr)
     {
