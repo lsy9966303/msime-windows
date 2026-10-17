@@ -337,11 +337,10 @@ TEST_CASE(english_spelling_wide_prefix_keeps_global_ranking_and_refreshes_after_
     EnglishDictionary dictionary(test::Utf8(database.path()));
     // A wide prefix with winners near its far end rules out an arbitrary scan
     // cutoff. Its non-power-of-two row count also exercises the compact tree.
-    database.execute(
-        "WITH RECURSIVE numbers(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM numbers WHERE n<16383) "
-        "INSERT INTO english_words(word,display,weight) "
-        "SELECT 'ca'||char(97+n/17576)||char(97+n/676%26)||char(97+n/26%26)||char(97+n%26),"
-        "'ca'||char(97+n/17576)||char(97+n/676%26)||char(97+n/26%26)||char(97+n%26),0 FROM numbers;");
+    database.execute("WITH RECURSIVE numbers(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM numbers WHERE n<16383) "
+                     "INSERT INTO english_words(word,display,weight) "
+                     "SELECT 'ca'||char(97+n/17576)||char(97+n/676%26)||char(97+n/26%26)||char(97+n%26),"
+                     "'ca'||char(97+n/17576)||char(97+n/676%26)||char(97+n/26%26)||char(97+n%26),0 FROM numbers;");
     database.execute("INSERT INTO english_words VALUES"
                      "('ca','CA',1),('ca','Ca',1),('ca','ca',1),"
                      "('cab','cab',1000),('cazzzx','cazzzx',1000),"
