@@ -7,6 +7,8 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
+#include <tuple>
 #include <spdlog/spdlog.h>
 #include <utility>
 
@@ -84,6 +86,179 @@ std::vector<WordItem> EnglishDictionary::query_mixed_prefix(const std::string &p
     if (!IsLowerAsciiWord(prefix) || limit == 0 || !ensure_mixed_query_statement())
         return {};
     return QueryPrefix(mixed_query_statement_, prefix, (std::min)(limit, kMixedCandidateLimit));
+}
+
+std::vector<WordItem> EnglishDictionary::query_candidates(const std::string &input, size_t limit, bool mixed,
+                                                          bool reconvert)
+{
+    std::string prefix = input;
+    std::transform(prefix.begin(), prefix.end(), prefix.begin(),
+                   [](unsigned char ch) { return static_cast<char>(ch >= 'A' && ch <= 'Z' ? ch + ('a' - 'A') : ch); });
+    auto exact = mixed ? query_mixed_prefix(prefix, limit) : query_prefix(prefix, limit);
+    if ((!exact.empty() && !reconvert) || limit == 0 || prefix.size() < 3 || prefix.size() > 24 ||
+        !IsLowerAsciiWord(prefix))
+        return exact;
+    std::vector<WordItem> result;
+    if (reconvert)
+        result.emplace_back("", input, 0, CandidateSource::Generated);
+
+    // Like upstream mobile correction (#8237), preserve deliberate abbreviations
+    // and camelCase rather than offering a spelling replacement for them.
+    if (std::any_of(input.begin() + 1, input.end(), [](unsigned char ch) { return ch >= 'A' && ch <= 'Z'; }))
+        return result;
+    if (!ensure_correction_index())
+        return result;
+    // The sorted index is built only on the first typo, and refreshed only after
+    // a dictionary write. Binary prefix probes avoid hundreds of SQL calls per
+    // typo. Input bounds cap probes at 1321; each spelling contributes three rows.
+    std::map<std::string, int> variants;
+    const auto add = [&](std::string value, int cost) {
+        if (value != prefix && value.size() >= 2)
+        {
+            const auto found = variants.find(value);
+            if (found == variants.end() || cost < found->second)
+                variants.insert_or_assign(std::move(value), cost);
+        }
+    };
+    for (size_t i = 0; i < prefix.size(); ++i)
+    {
+        auto value = prefix;
+        value.erase(i, 1);
+        add(std::move(value), 1);
+        if (i + 1 < prefix.size())
+        {
+            value = prefix;
+            std::swap(value[i], value[i + 1]);
+            add(std::move(value), 0);
+        }
+        for (char ch = 'a'; ch <= 'z'; ++ch)
+        {
+            value = prefix;
+            value[i] = ch;
+            add(std::move(value), 2);
+        }
+    }
+    for (size_t i = 0; i <= prefix.size(); ++i)
+        for (char ch = 'a'; ch <= 'z'; ++ch)
+        {
+            auto value = prefix;
+            value.insert(value.begin() + static_cast<std::ptrdiff_t>(i), ch);
+            add(std::move(value), 1);
+        }
+
+    struct Match
+    {
+        WordItem item;
+        bool whole_word;
+        int edit_cost;
+    };
+    std::map<std::string, Match> unique;
+    for (const auto &[variant, cost] : variants)
+    {
+        auto found =
+            std::lower_bound(spelling_index_.begin(), spelling_index_.end(), variant,
+                             [](const SpellingEntry &entry, const std::string &key) { return entry.key < key; });
+        std::vector<const SpellingEntry *> best;
+        for (; found != spelling_index_.end() && found->key.compare(0, variant.size(), variant) == 0; ++found)
+        {
+            best.push_back(&*found);
+            std::sort(best.begin(), best.end(), [&](const auto *a, const auto *b) {
+                if ((a->key == variant) != (b->key == variant))
+                    return a->key == variant;
+                if (a->weight != b->weight)
+                    return a->weight > b->weight;
+                if (a->key.size() != b->key.size())
+                    return a->key.size() < b->key.size();
+                return std::tie(a->key, a->display) < std::tie(b->key, b->display);
+            });
+            if (best.size() > 3)
+                best.pop_back();
+        }
+        for (const auto *entry : best)
+        {
+            if (entry->key == prefix)
+                continue;
+            WordItem item(entry->key, entry->display, entry->weight, CandidateSource::EnglishDictionary);
+            const bool whole_word = item.pinyin == variant;
+            if (input.front() >= 'A' && input.front() <= 'Z' && !item.word.empty() && item.word.front() >= 'a' &&
+                item.word.front() <= 'z')
+                item.word.front() -= 'a' - 'A';
+            auto found = unique.find(item.word);
+            if (found == unique.end() || (whole_word && !found->second.whole_word) ||
+                (whole_word == found->second.whole_word && cost < found->second.edit_cost))
+            {
+                item.corrected_from = input;
+                const std::string display = item.word;
+                unique.insert_or_assign(display, Match{std::move(item), whole_word, cost});
+            }
+        }
+    }
+    std::vector<Match> matches;
+    for (auto &[word, match] : unique)
+        matches.push_back(std::move(match));
+    std::sort(matches.begin(), matches.end(), [](const Match &a, const Match &b) {
+        if (a.whole_word != b.whole_word)
+            return a.whole_word;
+        if (a.edit_cost != b.edit_cost)
+            return a.edit_cost < b.edit_cost;
+        if (a.item.weight != b.item.weight)
+            return a.item.weight > b.item.weight;
+        if (a.item.word.size() != b.item.word.size())
+            return a.item.word.size() < b.item.word.size();
+        return a.item.word < b.item.word;
+    });
+    for (auto &match : matches)
+    {
+        if (result.size() >= (std::min)(limit, kMixedCandidateLimit))
+            break;
+        result.push_back(std::move(match.item));
+    }
+    return result;
+}
+
+bool EnglishDictionary::ensure_correction_index()
+{
+    if (!ensure_query_statement())
+        return false;
+    sqlite3_stmt *version = nullptr;
+    if (sqlite3_prepare_v2(db_, "PRAGMA data_version", -1, &version, nullptr) != SQLITE_OK)
+        return false;
+    const int current_version = sqlite3_step(version) == SQLITE_ROW ? sqlite3_column_int(version, 0) : -1;
+    sqlite3_finalize(version);
+    if (current_version < 0)
+        return false;
+    if (spelling_data_version_ == current_version)
+        return true;
+    sqlite3_stmt *query = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT word,display,weight FROM english_words ORDER BY word LIMIT 500001", -1, &query,
+                           nullptr) != SQLITE_OK)
+        return false;
+    std::vector<SpellingEntry> entries;
+    int status = SQLITE_ROW;
+    while ((status = sqlite3_step(query)) == SQLITE_ROW)
+    {
+        const auto *key = reinterpret_cast<const char *>(sqlite3_column_text(query, 0));
+        const auto *display = reinterpret_cast<const char *>(sqlite3_column_text(query, 1));
+        if (!key || !display)
+            continue;
+        const std::string word(key);
+        if (word.size() > 64 || !IsLowerAsciiWord(word))
+            continue;
+        if (entries.size() >= 500000)
+        {
+            sqlite3_finalize(query);
+            spelling_index_.clear();
+            spelling_data_version_ = current_version;
+            return true; // Do not repeat an oversized index build on every key.
+        }
+        entries.push_back({word, display, sqlite3_column_int64(query, 2)});
+    }
+    sqlite3_finalize(query);
+    if (status != SQLITE_DONE)
+        return false;
+    spelling_index_ = std::move(entries);
+    spelling_data_version_ = current_version;
+    return true;
 }
 
 bool EnglishDictionary::ready()
@@ -375,6 +550,8 @@ bool EnglishDictionary::ensure_gloss_statements()
 
 void EnglishDictionary::close_database()
 {
+    spelling_index_.clear();
+    spelling_data_version_ = -1;
     if (mixed_query_statement_ != nullptr)
     {
         sqlite3_finalize(mixed_query_statement_);

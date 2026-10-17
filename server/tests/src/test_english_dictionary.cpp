@@ -285,3 +285,48 @@ TEST_CASE(EnglishDictionaryUpsertsGlossForCloudFallback)
     REQUIRE(EnglishDictionary::upsert_gloss(test::Utf8(database.path()), false, "metasequoia", "水杉"));
     REQUIRE_EQ(dictionary.query_chinese_gloss("metasequoia"), std::string("水杉"));
 }
+
+TEST_CASE(english_spelling_fallback_keeps_exact_prefixes_and_recovers_single_edits)
+{
+    TemporaryEnglishDatabase database;
+    EnglishDictionary dictionary(test::Utf8(database.path()));
+    database.execute("INSERT INTO english_words VALUES('working','working',400);"
+                     "INSERT INTO english_words VALUES('worked','worked',300);"
+                     "INSERT INTO english_words VALUES('receive','receive',200);");
+    for (const auto &typo : {"wroking", "workign", "workng", "workking", "workimg", "recieve"})
+    {
+        const auto words = dictionary.query_candidates(typo, 3, true);
+        REQUIRE(!words.empty());
+        REQUIRE_EQ(words.front().word, std::string(typo) == "recieve" ? "receive" : "working");
+        REQUIRE_EQ(words.front().corrected_from, typo);
+    }
+    const auto exact = dictionary.query_candidates("work", 3, true);
+    REQUIRE(!exact.empty());
+    REQUIRE(exact.front().corrected_from.empty());
+    REQUIRE(dictionary.query_candidates("wr", 3).empty());
+    REQUIRE(dictionary.query_candidates("w0rking", 3).empty());
+    REQUIRE(dictionary.query_candidates(std::string(25, 'q'), 3).empty());
+    REQUIRE(dictionary.query_candidates("wroking", 0).empty());
+    REQUIRE(dictionary.query_candidates("zzzzzzzz", 3).empty());
+    REQUIRE(dictionary.query_candidates("wroking", 1).size() == 1);
+    const auto capitalized = dictionary.query_candidates("Wroking", 1);
+    REQUIRE(!capitalized.empty());
+    REQUIRE_EQ(capitalized.front().word, "Working");
+    REQUIRE(dictionary.query_candidates("WROKING", 3).empty());
+    REQUIRE(dictionary.query_candidates("wRoKing", 3).empty());
+    REQUIRE(dictionary.query_candidates("unicornxzy", 3).empty());
+    database.execute("INSERT INTO english_words VALUES('unicornxyz','unicornxyz',500);");
+    const auto refreshed = dictionary.query_candidates("unicornxzy", 1);
+    REQUIRE(!refreshed.empty());
+    REQUIRE_EQ(refreshed.front().word, "unicornxyz");
+    // Raw Enter may have learned the typo. Explicit reconversion still offers
+    // alternatives, but never silently overwrites or deletes that literal.
+    database.execute("INSERT INTO english_words VALUES('wroking','wroking',9000);");
+    const auto learned = dictionary.query_candidates("wroking", 3);
+    REQUIRE_EQ(learned.front().word, "wroking");
+    const auto manual = dictionary.query_candidates("wroking", 32, false, true);
+    REQUIRE_EQ(manual.front().word, "wroking");
+    REQUIRE(manual.front().source == CandidateSource::Generated);
+    REQUIRE(std::any_of(manual.begin(), manual.end(),
+                        [](const auto &item) { return item.word == "working" && item.corrected_from == "wroking"; }));
+}
